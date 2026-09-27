@@ -35,6 +35,12 @@ class FootballTest(unittest.TestCase):
             ["KXMLBSPREAD-26SEP261605NYMWSH", "KXMLBTOTAL-26SEP261605NYMWSH"],
         )
 
+    def test_derives_college_football_spread_and_total_companion_tickers(self):
+        self.assertEqual(
+            companion_event_tickers("KXNCAAFGAME-26SEP26ALBYPRIN", "KXNCAAFGAME"),
+            ["KXNCAAFSPREAD-26SEP26ALBYPRIN", "KXNCAAFTOTAL-26SEP26ALBYPRIN"],
+        )
+
     def test_normalized_catalog_has_fixed_venue_slots(self):
         catalog = market_catalog([{"category": "moneyline", "market": "Mets win", "yes_ask": "0.51", "no_ask": "0.50"}], [])
         self.assertEqual(set(catalog[0]["quotes"]), {"kalshi", "polymarket_us", "novig", "prophetx"})

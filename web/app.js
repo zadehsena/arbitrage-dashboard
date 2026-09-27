@@ -17,6 +17,7 @@ const oddsRefreshIntervalMs = 60_000;
 const sportPageSize = 25;
 const walletRefreshIntervalMs = 30_000;
 let walletRefreshInFlight = false;
+const renderedQuoteValues = new Map();
 
 const price = value => value == null ? '—' : `$${Number(value).toFixed(3)}`;
 const safe = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -31,6 +32,23 @@ function teamMarkup(team) {
   const subtitle = team.record || '';
   const image = team.logo ? `<img src="${safe(team.logo)}" alt="" loading="lazy" onerror="this.hidden=true;this.nextElementSibling.hidden=false">` : '';
   return `<div class="team"><span class="team-logo">${image}<b${team.logo ? ' hidden' : ''}>${safe(initials(name))}</b></span><span>${safe(name)}<small>${safe(subtitle)}</small></span></div>`;
+}
+
+const sportIconPaths = {
+  baseball: '<circle cx="12" cy="12" r="9"/><path d="M6 5c3 3 3 11 0 14M18 5c-3 3-3 11 0 14"/>',
+  basketball: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c4 4 4 14 0 18M5 5c4 3 10 3 14 0"/>',
+  football: '<path d="M5 18c-3-3 0-9 5-12s10-2 11 1c1 4-3 9-8 11s-7 2-8 0Z"/><path d="m9 8 7 7M12 10l-2 2m5 1-2 2m1-5 2-2"/>',
+  hockey: '<ellipse cx="10" cy="8" rx="6" ry="3"/><path d="M4 8v5c0 2 12 2 12 0V8M16 15h3l2 4h-8l-2-4 3-7"/>',
+  mma: '<path d="M7 5h4v5H7zM13 14h4v5h-4zM11 7l2 2m-4 2 2 2m2-2 2-2"/><path d="M5 11h3v3H5zM16 8h3v3h-3z"/>',
+  esports: '<path d="M7 9h10a3 3 0 0 1 3 3v3a3 3 0 0 1-3 3h-2l-2-2h-2l-2 2H7a3 3 0 0 1-3-3v-3a3 3 0 0 1 3-3Z"/><path d="M8 13h3m-1.5-1.5v3M16 13h.01M18 12h.01"/>',
+  soccer: '<circle cx="12" cy="12" r="9"/><path d="m12 7 4 3-1 5h-6l-1-5 4-3Zm0 0V3m4 3 4 2m-5 7 3 4m-9-4-3 4m-1-9-4-2"/>',
+  tennis: '<circle cx="12" cy="12" r="9"/><path d="M5 5c7 1 12 6 14 14M19 5C12 6 7 11 5 19"/>',
+};
+
+function homeSportIcon(sport) {
+  const label = String(sport || 'Sport');
+  const paths = sportIconPaths[label] || '<circle cx="12" cy="12" r="8"/><path d="M12 8v5m0 3h.01"/>';
+  return `<span class="home-sport-icon" role="img" aria-label="${safe(label)}" title="${safe(label)}"><svg viewBox="0 0 24 24" aria-hidden="true">${paths}</svg></span>`;
 }
 
 function teamsForRecord(record) {
@@ -127,13 +145,45 @@ function orderedBookItems(record, items, labelField) {
   return ordered.slice(0, 2);
 }
 
+function rollingPrice(value, tone, key, title = '') {
+  const numericValue = numericQuote(value);
+  if (numericValue == null) return '<span class="price unavailable">—</span>';
+  const tooltip = title ? ` title="${safe(title)}"` : '';
+  return `<span class="price ${tone}" data-quote-key="${safe(key)}" data-quote-value="${numericValue}"${tooltip}>${price(numericValue)}</span>`;
+}
+
+function animateUpdatedQuotes() {
+  const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+  document.querySelectorAll('.price[data-quote-key]').forEach(element => {
+    const key = element.dataset.quoteKey;
+    const target = Number(element.dataset.quoteValue);
+    const previous = renderedQuoteValues.get(key);
+    renderedQuoteValues.set(key, target);
+    if (reducedMotion || !Number.isFinite(previous) || previous === target) return;
+
+    const startedAt = performance.now();
+    const duration = 420;
+    element.classList.add('price-rolling');
+    const tick = now => {
+      const progress = Math.min(1, (now - startedAt) / duration);
+      const eased = 1 - ((1 - progress) ** 3);
+      element.textContent = price(previous + ((target - previous) * eased));
+      if (progress < 1) requestAnimationFrame(tick);
+      else element.textContent = price(target);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
 function pairForBook(record, items, labelField, priceField, venueUrl, venueName) {
   const ordered = orderedBookItems(record, items, labelField);
-  const tiles = ordered.map(item => {
+  const eventKey = record.kalshi_event_ticker || record.polymarket_us_event_slug || record.kalshi_title;
+  const tiles = ordered.map((item, index) => {
     if (!item) return '<span class="outcome-tile"><span class="price unavailable">—</span></span>';
     const value = Number(item[priceField]);
     const tone = Number.isFinite(value) && value < 0.5 ? 'down' : 'up';
-    return `<span class="outcome-tile"><span class="price ${tone}" title="${safe(item[labelField])}">${price(item[priceField])}</span></span>`;
+    const key = `${venueName}:${eventKey}:${item[labelField] || index}`;
+    return `<span class="outcome-tile">${rollingPrice(item[priceField], tone, key, item[labelField])}</span>`;
   }).join('');
   if (!venueUrl) return `<div class="book-pair">${tiles}</div>`;
   return `<a class="book-link" href="${safe(venueUrl)}" target="_blank" rel="noopener noreferrer" aria-label="Open this event on ${safe(venueName)}"><span class="book-pair">${tiles}</span></a>`;
@@ -196,6 +246,7 @@ function renderSport(data, append = false) {
     <td class="unavailable-book" aria-label="ProphetX data not connected"></td>
     <td>${arbitrageCell(record)}</td>
   </tr>`).join('')}</tbody></table>${loadMore}`;
+  animateUpdatedQuotes();
 }
 
 function walletCard(wallet) {
@@ -214,7 +265,7 @@ function renderHome(data, opportunityData = {}) {
   const wallets = data.wallets || [];
   const opportunities = opportunityData.opportunities || [];
   const sportCounts = opportunityData.sport_counts || {};
-  latestRecords = [];
+  latestRecords = opportunities;
   nextSportOffset = null;
   sportRecordTotal = 0;
   tableWrap.classList.add('home-layout');
@@ -225,14 +276,19 @@ function renderHome(data, opportunityData = {}) {
   document.querySelector('#sidebar-updated').textContent = `Updated ${new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(data.updated_at || Date.now()))}`;
   meta.textContent = 'Connected wallet balances · auto-refreshes every 30s';
   notice.hidden = true;
-  const quotePair = (quotes, url, venue) => {
-    const pair = `<span class="book-pair"><span class="price ${Number(quotes?.[0]) < .5 ? 'down' : 'up'}">${price(quotes?.[0])}</span><span class="price ${Number(quotes?.[1]) < .5 ? 'down' : 'up'}">${price(quotes?.[1])}</span></span>`;
+  const quotePair = (row, quotes, url, venue) => {
+    const eventKey = row.kalshi_ticker || row.polymarket_us_slug || row.title;
+    const tone = value => Number(value) < .5 ? 'down' : 'up';
+    const values = quotes?.length ? quotes : [null, null];
+    const pair = `<span class="book-pair">${values.map((value, index) =>
+      rollingPrice(value, tone(value), `${venue}:${eventKey}:${index}`)).join('')}</span>`;
     return url ? `<a class="book-link" href="${safe(url)}" target="_blank" rel="noopener noreferrer" aria-label="Open this event on ${safe(venue)}">${pair}</a>` : pair;
   };
-  const opportunitiesTable = opportunities.length ? opportunities.map(row => `<tr><td>${row.teams?.length ? `<div class="game-teams">${row.teams.map(teamMarkup).join('')}</div>` : `<span class="game">${safe(row.title)}</span>`}</td><td><span class="start">${safe(startTime(row.start_time))}</span></td><td>${quotePair(row.kalshi, row.kalshi_url, 'Kalshi')}</td><td>${quotePair(row.polymarket_us, row.polymarket_us_url, 'Polymarket US')}</td><td class="unavailable-book"></td><td class="unavailable-book"></td><td>${row.edge ? `<div class="arb"><strong>+${(row.edge * 100).toFixed(2)}%</strong></div>` : '<span class="no-arb">—</span>'}</td></tr>`).join('') : '<tr><td colspan="7" class="detail-empty">No current opportunities in cached reports. Select a sport and refresh its data.</td></tr>';
+  const opportunitiesTable = opportunities.length ? opportunities.map((row, index) => `<tr class="game-row" data-game-index="${index}" tabindex="0" role="link" aria-label="Open ${safe(row.title || 'game')} market breakdown"><td class="sport-cell">${homeSportIcon(row.sport)}</td><td>${row.teams?.length ? `<div class="game-teams">${row.teams.map(teamMarkup).join('')}</div>` : `<span class="game">${safe(row.title)}</span>`}</td><td><span class="start">${safe(startTime(row.start_time))}</span></td><td>${quotePair(row, row.kalshi, row.kalshi_url, 'Kalshi')}</td><td>${quotePair(row, row.polymarket_us, row.polymarket_us_url, 'Polymarket US')}</td><td class="unavailable-book"></td><td class="unavailable-book"></td><td>${row.edge ? `<div class="arb"><strong>+${(row.edge * 100).toFixed(2)}%</strong></div>` : '<span class="no-arb">—</span>'}</td></tr>`).join('') : '<tr><td colspan="8" class="detail-empty">No current opportunities in cached reports. Select a sport and refresh its data.</td></tr>';
   const total = Object.values(sportCounts).reduce((sum, count) => sum + count, 0);
   const sportList = Object.entries(sportCounts).filter(([, count]) => count).sort((a, b) => b[1] - a[1]).map(([name, count]) => `<li><span>${safe(name)}</span><b>${count}</b></li>`).join('') || '<li><span>No report data yet</span></li>';
-  tableWrap.innerHTML = `<section class="wallet-grid">${wallets.map(walletCard).join('')}</section><h2 class="home-section-title">Top Opportunities</h2><section class="opportunities"><div class="opportunity-table"><table><thead><tr><th>Game / Event</th><th>Start time</th><th><span class="book-heading"><b class="venue-icon kalshi">K</b>Kalshi</span></th><th><span class="book-heading"><b class="venue-icon polymarket">◇</b>Polymarket US</span></th><th><span class="book-heading"><b class="venue-icon novig">N</b>Novig</span></th><th><span class="book-heading"><b class="venue-icon prophetx">P</b>ProphetX</span></th><th>Arbitrage</th></tr></thead><tbody>${opportunitiesTable}</tbody></table></div></section><section class="sport-summary"><div class="summary-ring"><strong>${total}</strong><span>Games</span></div><div><h2>Opportunities by sport</h2><ul>${sportList}</ul></div></section>`;
+  tableWrap.innerHTML = `<section class="wallet-grid">${wallets.map(walletCard).join('')}</section><h2 class="home-section-title">Top Opportunities</h2><section class="opportunities"><div class="opportunity-table"><table><thead><tr><th class="sport-column"><span class="sr-only">Sport</span></th><th>Game / Event</th><th>Start time</th><th><span class="book-heading"><b class="venue-icon kalshi">K</b>Kalshi</span></th><th><span class="book-heading"><b class="venue-icon polymarket">◇</b>Polymarket US</span></th><th><span class="book-heading"><b class="venue-icon novig">N</b>Novig</span></th><th><span class="book-heading"><b class="venue-icon prophetx">P</b>ProphetX</span></th><th>Arbitrage</th></tr></thead><tbody>${opportunitiesTable}</tbody></table></div></section><section class="sport-summary"><div class="summary-ring"><strong>${total}</strong><span>Games</span></div><div><h2>Opportunities by sport</h2><ul>${sportList}</ul></div></section>`;
+  animateUpdatedQuotes();
 }
 
 async function loadHome() {
@@ -325,14 +381,14 @@ home.addEventListener('click', event => {
   loadHome();
 });
 refresh.addEventListener('click', () => activeSport ? loadSport(true) : loadHome());
-function openGameDetail(record, index) {
+function openGameDetail(record) {
+  const sport = activeSport || record?.sport;
   const params = new URLSearchParams({
-    sport: activeSport,
-    kalshi: record.kalshi_event_ticker,
-    polymarket: record.polymarket_us_event_slug,
+    sport,
+    kalshi: record.kalshi_event_ticker || record.kalshi_ticker,
+    polymarket: record.polymarket_us_event_slug || record.polymarket_slug,
   });
   if (activeLeagues.length) params.set('leagues', activeLeagues.join(','));
-  params.set('offset', String(Math.floor(index / sportPageSize) * sportPageSize));
   window.location.assign(`/game.html?${params}`);
 }
 tableWrap.addEventListener('click', event => {
@@ -343,13 +399,13 @@ tableWrap.addEventListener('click', event => {
   const row = event.target.closest('.game-row');
   if (!row || event.target.closest('a')) return;
   const index = Number(row.dataset.gameIndex);
-  openGameDetail(latestRecords[index], index);
+  openGameDetail(latestRecords[index]);
 });
 tableWrap.addEventListener('keydown', event => {
   if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('.game-row')) {
     event.preventDefault();
     const index = Number(event.target.dataset.gameIndex);
-    openGameDetail(latestRecords[index], index);
+    openGameDetail(latestRecords[index]);
   }
 });
 document.querySelector('#search').addEventListener('input', event => {

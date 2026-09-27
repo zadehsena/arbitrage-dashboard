@@ -29,7 +29,10 @@ SPORT_LEAGUE_MAPPINGS: dict[str, tuple[tuple[str, str], ...]] = {
     ),
 }
 SPORT_MATCHING_VERSION = 3
-DETAIL_FETCH_WORKERS = 8
+# Each record can require Kalshi's game, spread, and total event endpoints.
+# Keep this deliberately small so a report refresh does not burst past the
+# public API limit before the client-side pacing/retry logic can respond.
+DETAIL_FETCH_WORKERS = 2
 
 # Kalshi shortens many MLB club names in event titles. Expand only complete
 # known names, keeping Chicago and New York clubs distinct before title scoring.

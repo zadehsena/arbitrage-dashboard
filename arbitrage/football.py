@@ -28,8 +28,13 @@ KALSHI_SERIES_BY_LEAGUE = {"cfb": "KXNCAAFGAME", "nfl": "KXNFLGAME"}
 # display the contracts visible under a KXMLBSPREAD market URL.
 KALSHI_COMPANION_SERIES = {
     "KXMLBGAME": ("KXMLBSPREAD", "KXMLBTOTAL"),
+    # College football uses the same game suffix across its separate winner,
+    # spread, and total event series. Fetching only KXNCAAFGAME left the
+    # detail page's Kalshi spread/total sections empty even though those
+    # contracts were listed on Kalshi.
+    "KXNCAAFGAME": ("KXNCAAFSPREAD", "KXNCAAFTOTAL"),
 }
-MARKET_BREAKDOWN_VERSION = 3
+MARKET_BREAKDOWN_VERSION = 4
 VENUES = ("kalshi", "polymarket_us", "novig", "prophetx")
 
 

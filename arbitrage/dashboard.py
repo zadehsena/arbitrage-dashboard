@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
@@ -51,6 +52,60 @@ def _cached_source_counts(report_path: Path) -> tuple[int | None, int | None]:
         return metadata.get("kalshi_events_compared"), metadata.get("polymarket_events_compared")
     except (OSError, json.JSONDecodeError):
         return None, None
+
+
+def _normalized_outcome_label(value: object) -> str:
+    """Normalize a team/outcome label without relying on API item order."""
+    text = str(value or "").lower()
+    # Kalshi labels often read "Team wins" while the other venue provides
+    # simply "Team". Remove the surrounding contract wording, then compare
+    # the meaningful team names.
+    text = re.sub(r"\b(will|the|win|wins|match|game)\b", " ", text)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _is_draw_outcome(value: object) -> bool:
+    """Return whether a venue's outcome label represents a drawn game."""
+    return bool(re.search(r"\b(draw|tie)\b", str(value or ""), re.IGNORECASE))
+
+
+def _ordered_moneyline_quotes(record: dict, items_key: str, label_key: str,
+                              quote_key: str, include_draw: bool = False) -> list[object | None]:
+    """Return venue quotes in the displayed team order.
+
+    Event feeds need not list the two winner contracts in the same order. A
+    positional comparison could therefore pair a team's price with the other
+    venue's opponent price and fabricate an arbitrage signal. Missing or
+    unrecognizable labels deliberately remain unavailable rather than being
+    guessed from their position.
+    """
+    items = list(record.get(items_key, []))
+    teams = [team.get("name") for team in record.get("teams", []) if team.get("name")]
+    if len(teams) < 2:
+        # Legacy cached reports lack team metadata. Preserve their display,
+        # but do not use this fallback for reports that can be aligned.
+        return [item.get(quote_key) for item in items[:3 if include_draw else 2]]
+
+    unused = list(items)
+    quotes: list[object | None] = []
+    for team in teams[:2]:
+        team_label = _normalized_outcome_label(team)
+        index = None
+        for candidate_index, item in enumerate(unused):
+            item_label = _normalized_outcome_label(item.get(label_key))
+            if team_label and item_label and (team_label == item_label
+                                              or team_label in item_label
+                                              or item_label in team_label):
+                index = candidate_index
+                break
+        quotes.append(unused.pop(index).get(quote_key) if index is not None else None)
+    draw_index = next((index for index, item in enumerate(unused)
+                       if _is_draw_outcome(item.get(label_key))), None)
+    draw_quote = unused.pop(draw_index).get(quote_key) if draw_index is not None else None
+    # Preserve a shared slot for the draw in both books. If only one venue
+    # supplied it, the other is deliberately unavailable and cannot create an
+    # apparent three-way arbitrage.
+    return [quotes[0], draw_quote, quotes[1]] if include_draw else quotes
 
 
 def _requested_leagues(query: str) -> tuple[str, ...] | None:
@@ -142,10 +197,24 @@ def opportunities_payload() -> dict:
         current = [record for record in records if is_current_sport_record(record, sport)]
         counts[sport] = len(current)
         for record in current:
-            kalshi = [item.get("yes_ask") for item in record.get("kalshi_moneyline_asks", [])[:2]]
-            poly = [item.get("displayed_quote") for item in record.get("polymarket_us_displayed_moneyline_quotes", [])[:2]]
+            # Both quote arrays must use the visible team order. Kalshi and
+            # Polymarket US are free to return their contracts in opposite
+            # orders for the same game.
+            has_draw = any(_is_draw_outcome(item.get("contract"))
+                           for item in record.get("kalshi_moneyline_asks", [])) or any(
+                _is_draw_outcome(item.get("outcome"))
+                for item in record.get("polymarket_us_displayed_moneyline_quotes", []))
+            kalshi = _ordered_moneyline_quotes(
+                record, "kalshi_moneyline_asks", "contract", "yes_ask", has_draw)
+            poly = _ordered_moneyline_quotes(
+                record, "polymarket_us_displayed_moneyline_quotes", "outcome", "displayed_quote", has_draw)
             try:
-                total = min(float(kalshi[0]) + float(poly[1]), float(kalshi[1]) + float(poly[0]))
+                if len(kalshi) != len(poly):
+                    raise ValueError("venue outcome counts differ")
+                # Choose the lower displayed quote for each mutually
+                # exclusive outcome, including draw when it is offered.
+                total = sum(min(float(kalshi[index]), float(poly[index]))
+                            for index in range(len(kalshi)))
                 edge = max(0, 1 - total)
             except (IndexError, TypeError, ValueError):
                 edge = 0
@@ -157,6 +226,32 @@ def opportunities_payload() -> dict:
                          "kalshi_url": record.get("kalshi_url"),
                          "polymarket_us_url": record.get("polymarket_us_url")})
     return {"opportunities": sorted(rows, key=lambda row: row["edge"], reverse=True)[:8], "sport_counts": counts}
+
+
+def game_payload(sport: str, kalshi_ticker: str, polymarket_slug: str) -> dict:
+    """Find one current game across the sport's cached league reports."""
+    if sport not in supported_sports():
+        raise ValueError(f"unsupported sport: {sport}")
+    if not kalshi_ticker or not polymarket_slug:
+        raise ValueError("both venue event identifiers are required")
+
+    # A Home opportunity can originate in an all-league cache while a sidebar
+    # tab uses a league-specific cache. Search both so a click always opens
+    # the selected event instead of assuming it falls within a particular page.
+    paths = sorted(REPORTS_DIR.glob(f"{sport}*_matches.json"),
+                   key=lambda path: (path.name != f"{sport}_matches.json", path.name))
+    for path in paths:
+        try:
+            records = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        record = next((item for item in records
+                       if item.get("kalshi_event_ticker") == kalshi_ticker
+                       and item.get("polymarket_us_event_slug") == polymarket_slug
+                       and is_current_sport_record(item, sport)), None)
+        if record is not None:
+            return {"record": record}
+    raise LookupError("This game is no longer active or is unavailable in the latest report.")
 
 
 def sport_payload(sport: str, leagues: tuple[str, ...] | None = None,
@@ -172,22 +267,30 @@ def sport_payload(sport: str, leagues: tuple[str, ...] | None = None,
     # displays records fetched for the other category.
     cache_suffix = f"_{'-'.join(leagues)}" if leagues else ""
     report_path = REPORTS_DIR / f"{sport}{cache_suffix}_matches.json"
-    if refresh or not report_path.exists():
-        records, kalshi_count, polymarket_count = build_sport_report(sport, leagues)
-        _write_sport_report_cache(report_path, records, kalshi_count, polymarket_count)
-    else:
-        records = json.loads(report_path.read_text())
-        kalshi_count, polymarket_count = _cached_source_counts(report_path)
-        # Reports written before logo support lack the `teams` field. Refresh
-        # them automatically instead of showing permanent initials badges.
-        if any(not record.get("teams") or not record.get("kalshi_url") or not record.get("polymarket_us_url")
-               or not record.get("kalshi_market_breakdown") or not record.get("polymarket_us_market_breakdown")
-               or "market_catalog" not in record
-               or (leagues and record.get("league") not in leagues)
-               or record.get("market_breakdown_version") != MARKET_BREAKDOWN_VERSION
-               for record in records):
+    try:
+        if refresh or not report_path.exists():
             records, kalshi_count, polymarket_count = build_sport_report(sport, leagues)
             _write_sport_report_cache(report_path, records, kalshi_count, polymarket_count)
+        else:
+            records = json.loads(report_path.read_text())
+            kalshi_count, polymarket_count = _cached_source_counts(report_path)
+            # Reports written before logo support lack the `teams` field. Refresh
+            # them automatically instead of showing permanent initials badges.
+            if any(not record.get("teams") or not record.get("kalshi_url") or not record.get("polymarket_us_url")
+                   or not record.get("kalshi_market_breakdown") or not record.get("polymarket_us_market_breakdown")
+                   or "market_catalog" not in record
+                   or (leagues and record.get("league") not in leagues)
+                   or record.get("market_breakdown_version") != MARKET_BREAKDOWN_VERSION
+                   for record in records):
+                records, kalshi_count, polymarket_count = build_sport_report(sport, leagues)
+                _write_sport_report_cache(report_path, records, kalshi_count, polymarket_count)
+    except Exception:
+        # A manual/automatic refresh must not turn a temporary venue throttle
+        # into a blank dashboard when a prior usable report is available.
+        if not report_path.exists():
+            raise
+        records = json.loads(report_path.read_text())
+        kalshi_count, polymarket_count = _cached_source_counts(report_path)
     # Older cached reports may predate the stale-event filter. Apply it at
     # read time too, so completed games disappear without needing a refresh.
     records = [record for record in records
@@ -226,6 +329,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             return
         if path == "/api/opportunities":
             self.send_json(opportunities_payload())
+            return
+        if path == "/api/game":
+            query = parse_qs(parsed_url.query)
+            try:
+                self.send_json(game_payload(
+                    query.get("sport", [""])[0],
+                    query.get("kalshi", [""])[0],
+                    query.get("polymarket", [""])[0],
+                ))
+            except (ValueError, LookupError) as error:
+                self.send_json({"error": str(error)}, HTTPStatus.NOT_FOUND)
             return
         sport = path.removeprefix("/api/sports/")
         if sport in supported_sports():

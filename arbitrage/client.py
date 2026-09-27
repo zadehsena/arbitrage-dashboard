@@ -3,21 +3,60 @@ from __future__ import annotations
 import json
 import ssl
 from functools import lru_cache
+from threading import Lock
+from time import monotonic, sleep
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POLYMARKET_US_GATEWAY_URL = "https://gateway.polymarket.us"
+KALSHI_MIN_REQUEST_INTERVAL_SECONDS = 0.05
+HTTP_RETRY_ATTEMPTS = 4
+_kalshi_rate_lock = Lock()
+_next_kalshi_request_at = 0.0
+
+
+def _pace_kalshi_request(url: str) -> None:
+    """Serialize public Kalshi reads into a sustainable request rate."""
+    if not url.startswith(KALSHI_BASE_URL):
+        return
+    global _next_kalshi_request_at
+    with _kalshi_rate_lock:
+        now = monotonic()
+        scheduled_at = max(now, _next_kalshi_request_at)
+        _next_kalshi_request_at = scheduled_at + KALSHI_MIN_REQUEST_INTERVAL_SECONDS
+    if scheduled_at > now:
+        sleep(scheduled_at - now)
+
+
+def _retry_delay(error: HTTPError, attempt: int) -> float:
+    """Honor a server retry hint when available, otherwise back off gently."""
+    try:
+        return max(0.1, float(error.headers.get("Retry-After", "")))
+    except (AttributeError, TypeError, ValueError):
+        return 0.6 * (2 ** attempt)
 
 
 def _get_json(url: str) -> Any:
     request = Request(url, headers={"Accept": "application/json", "User-Agent": "cross-venue-arbitrage-scanner/0.1"})
     import certifi
     context = ssl.create_default_context(cafile=certifi.where())
-    with urlopen(request, timeout=20, context=context) as response:
-        return json.load(response)
+    for attempt in range(HTTP_RETRY_ATTEMPTS):
+        _pace_kalshi_request(url)
+        try:
+            with urlopen(request, timeout=20, context=context) as response:
+                return json.load(response)
+        except HTTPError as error:
+            # Public feeds can temporarily throttle a refresh burst. Retry
+            # only rate/server errors; invalid requests should surface at once.
+            retryable = error.code == 429 or 500 <= error.code < 600
+            if not retryable or attempt == HTTP_RETRY_ATTEMPTS - 1:
+                raise
+            sleep(_retry_delay(error, attempt))
+    raise RuntimeError("unreachable HTTP retry state")
 
 
 def kalshi_market(ticker: str) -> dict[str, Any]:
