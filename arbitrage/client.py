@@ -13,6 +13,7 @@ from urllib.request import Request, urlopen
 
 KALSHI_BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 POLYMARKET_US_GATEWAY_URL = "https://gateway.polymarket.us"
+NOVIG_BASE_URL = "https://api.novig.com"
 KALSHI_MIN_REQUEST_INTERVAL_SECONDS = 0.05
 HTTP_RETRY_ATTEMPTS = 4
 _kalshi_rate_lock = Lock()
@@ -150,3 +151,42 @@ def polymarket_us_league_events(league: str, max_events: int = 500) -> list[dict
 
 def polymarket_us_event(slug: str) -> dict[str, Any]:
     return _get_json(f"{POLYMARKET_US_GATEWAY_URL}/v1/events/slug/{slug}")["event"]
+
+
+def novig_public_events(league: str, max_events: int = 500) -> list[dict[str, Any]]:
+    """Retrieve open Novig event catalog pages; no credentials are required."""
+    events: list[dict[str, Any]] = []
+    after: str | None = None
+    while len(events) < max_events:
+        query = {"league": league, "limit": min(5000, max_events - len(events))}
+        if after:
+            query["after"] = after
+        page = _get_json(f"{NOVIG_BASE_URL}/v3/public/catalog/events?{urlencode(query)}")
+        batch = page.get("items", [])
+        events.extend(batch)
+        after = page.get("next")
+        if not after or not batch:
+            break
+    return events[:max_events]
+
+
+def novig_public_moneyline_markets(league: str, max_markets: int = 5000) -> list[dict[str, Any]]:
+    """Retrieve Novig full-game two-way moneyline markets for one league."""
+    markets: list[dict[str, Any]] = []
+    after: str | None = None
+    while len(markets) < max_markets:
+        query = {"league": league, "marketType": "MONEY", "limit": min(5000, max_markets - len(markets))}
+        if after:
+            query["after"] = after
+        page = _get_json(f"{NOVIG_BASE_URL}/v3/public/catalog/markets?{urlencode(query)}")
+        batch = page.get("items", [])
+        markets.extend(batch)
+        after = page.get("next")
+        if not after or not batch:
+            break
+    return markets[:max_markets]
+
+
+def novig_public_book(market_id: str) -> dict[str, Any]:
+    """Retrieve the public bid ladder for a Novig market."""
+    return _get_json(f"{NOVIG_BASE_URL}/v3/public/catalog/markets/{market_id}/book")

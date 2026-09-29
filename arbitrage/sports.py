@@ -4,8 +4,16 @@ from __future__ import annotations
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from typing import Callable
 
-from .client import kalshi_open_events_for_series, polymarket_us_league_events
+from .client import (
+    kalshi_open_events_for_series,
+    novig_public_book,
+    novig_public_events,
+    novig_public_moneyline_markets,
+    polymarket_us_league_events,
+)
+from .discover import similarity
 from .football import match_events, report_record
 
 
@@ -33,6 +41,12 @@ SPORT_MATCHING_VERSION = 3
 # Keep this deliberately small so a report refresh does not burst past the
 # public API limit before the client-side pacing/retry logic can respond.
 DETAIL_FETCH_WORKERS = 2
+NOVIG_BOOK_FETCH_WORKERS = 6
+NOVIG_LEAGUE_BY_POLYMARKET_LEAGUE = {
+    "cfb": "NCAAF", "nfl": "NFL", "epl": "EPL", "mls": "MLS", "ucl": "UEFA_CHAMPIONS_LEAGUE",
+    "nhl": "NHL", "nba": "NBA", "wnba": "WNBA", "cbb": "NCAAB", "mlb": "MLB",
+    "ufc": "UFC", "atp": "ATP", "wta": "WTA",
+}
 
 # Kalshi shortens many MLB club names in event titles. Expand only complete
 # known names, keeping Chicago and New York clubs distinct before title scoring.
@@ -52,6 +66,17 @@ MLB_TEAM_ALIASES = {
     "Seattle": "Seattle Mariners", "St Louis": "St. Louis Cardinals",
     "Tampa Bay": "Tampa Bay Rays", "Texas": "Texas Rangers",
     "Toronto": "Toronto Blue Jays", "Washington": "Washington Nationals",
+}
+
+NFL_CITY_ALIASES = {
+    "ARI": "Arizona", "ATL": "Atlanta", "BAL": "Baltimore", "BUF": "Buffalo",
+    "CAR": "Carolina", "CHI": "Chicago", "CIN": "Cincinnati", "CLE": "Cleveland",
+    "DAL": "Dallas", "DEN": "Denver", "DET": "Detroit", "GB": "Green Bay",
+    "HOU": "Houston", "IND": "Indianapolis", "JAX": "Jacksonville", "KC": "Kansas City",
+    "LAC": "Los Angeles Chargers", "LAR": "Los Angeles Rams", "LV": "Las Vegas",
+    "MIA": "Miami", "MIN": "Minnesota", "NE": "New England", "NO": "New Orleans",
+    "NY": "New York", "PHI": "Philadelphia", "PIT": "Pittsburgh", "SEA": "Seattle",
+    "SF": "San Francisco", "TB": "Tampa Bay", "TEN": "Tennessee", "WAS": "Washington",
 }
 
 # Public league feeds can retain an event as active after it has finished.
@@ -100,6 +125,14 @@ def normalize_cfb_title(title: str) -> str:
                   flags=re.IGNORECASE)
 
 
+def normalize_nfl_title(title: str) -> str:
+    """Expand feed-style NFL city abbreviations for cross-venue matching."""
+    normalized = title
+    for abbreviation, name in NFL_CITY_ALIASES.items():
+        normalized = re.sub(rf"\b{abbreviation}\b", name, normalized, flags=re.IGNORECASE)
+    return normalized
+
+
 def supported_sports() -> tuple[str, ...]:
     return tuple(SPORT_LEAGUE_MAPPINGS)
 
@@ -140,6 +173,84 @@ def is_current_sport_record(record: dict, sport: str, now: datetime | None = Non
     # report rebuild whenever the College Football tab opens.
     live_window = timedelta(hours=3) if sport == "football" and record.get("league") == "cfb" else LIVE_WINDOWS[sport]
     return start + live_window > current_time
+
+
+def _novig_teams(description: object) -> list[str]:
+    """Return Novig's away/home names from its public event description."""
+    parts = re.split(r"\s+@\s+", str(description or ""), maxsplit=1)
+    return [part.strip() for part in parts] if len(parts) == 2 and all(parts) else []
+
+
+def _novig_quotes(event: dict, market: dict, book: dict) -> list[dict]:
+    """Turn Novig's bid-only binary book into executable outcome asks.
+
+    Buying one outcome is equivalent to selling its complement, so the best
+    ask is 1 minus the complement outcome's highest bid. Leave it empty when
+    the complementary ladder has no liquidity.
+    """
+    outcomes = list(market.get("outcomes", []))
+    teams = _novig_teams(event.get("description"))
+    quotes = []
+    for index, outcome in enumerate(outcomes):
+        complement = next((item for item in outcomes if item.get("outcomeId") != outcome.get("outcomeId")), None)
+        orders = list(book.get("orders", {}).get((complement or {}).get("outcomeId"), []))
+        try:
+            ask = 1 - max(float(order["price"]) for order in orders)
+            displayed_ask = f"{ask:.4f}"
+        except (KeyError, TypeError, ValueError):
+            displayed_ask = None
+        # Novig's MONEY outcome order is home then away, while event text is
+        # away @ home. Use the venue's full team name for safe cross-book
+        # alignment, falling back to the outcome code if it is unavailable.
+        label = teams[1 - index] if len(teams) == 2 and index < 2 else outcome.get("name")
+        quotes.append({"outcome": label, "displayed_ask": displayed_ask,
+                       "market_id": market.get("marketId")})
+    return quotes
+
+
+def _add_novig_moneylines(records: list[dict], polymarket_league: str,
+                          normalizer: Callable[[str], str] | None) -> list[dict]:
+    """Attach review-only Novig moneyline asks to already validated game rows."""
+    novig_league = NOVIG_LEAGUE_BY_POLYMARKET_LEAGUE.get(polymarket_league)
+    if not records or not novig_league:
+        return records
+    try:
+        events = novig_public_events(novig_league)
+        markets_by_event = {market.get("eventId"): market for market in novig_public_moneyline_markets(novig_league)
+                            if market.get("status") == "OPEN"}
+    except Exception:
+        # Novig availability must not prevent the existing two-venue report
+        # from rendering; missing quotes stay explicitly unavailable.
+        return records
+    normalize = normalize_nfl_title if polymarket_league == "nfl" else (normalizer or (lambda value: value))
+    event_by_record = {}
+    remaining = list(events)
+    for record in records:
+        title = normalize(str(record.get("polymarket_us_title", "")))
+        score, event = max(((similarity(title, normalize(str(item.get("description", "")))), item)
+                            for item in remaining), default=(0.0, None), key=lambda item: item[0])
+        if event is not None and score >= 0.72 and event.get("eventId") in markets_by_event:
+            event_by_record[id(record)] = event
+            remaining.remove(event)
+    selected = [(record, event_by_record[id(record)], markets_by_event[event_by_record[id(record)].get("eventId")])
+                for record in records if id(record) in event_by_record]
+    with ThreadPoolExecutor(max_workers=NOVIG_BOOK_FETCH_WORKERS) as executor:
+        books = list(executor.map(lambda item: novig_public_book(str(item[2]["marketId"])), selected))
+    for (record, event, market), book in zip(selected, books):
+        record["novig_event_id"] = event.get("eventId")
+        quotes = _novig_quotes(event, market, book)
+        # Preserve the dashboard's established team labels. Novig often uses
+        # a full city name while the other feeds use an abbreviation (PIT vs
+        # Pittsburgh); mapping the matched quote back to the record team keeps
+        # every venue in the same visible outcome slot.
+        record_teams = [str(team.get("name")) for team in record.get("teams", []) if team.get("name")]
+        for quote in quotes:
+            score, team = max(((similarity(str(quote.get("outcome", "")), candidate), candidate)
+                               for candidate in record_teams), default=(0.0, None), key=lambda item: item[0])
+            if team is not None and score >= 0.25:
+                quote["outcome"] = team
+        record["novig_moneyline_quotes"] = quotes
+    return records
 
 
 def build_sport_report(sport: str, leagues: tuple[str, ...] | None = None,
@@ -204,10 +315,11 @@ def build_sport_report(sport: str, leagues: tuple[str, ...] | None = None,
         # batch concurrently instead of waiting for every pair in sequence.
         with ThreadPoolExecutor(max_workers=DETAIL_FETCH_WORKERS) as executor:
             details = executor.map(lambda match: report_record(*match), matches)
-            records.extend(
+            league_records = [
                 {**record, "league": polymarket_league, "matching_version": SPORT_MATCHING_VERSION}
                 for record in details
-            )
+            ]
+        records.extend(_add_novig_moneylines(league_records, polymarket_league, normalizer))
         kalshi_count += len(kalshi_events)
         polymarket_count += len(polymarket_events)
     return records, kalshi_count, polymarket_count

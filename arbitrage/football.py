@@ -34,7 +34,7 @@ KALSHI_COMPANION_SERIES = {
     # contracts were listed on Kalshi.
     "KXNCAAFGAME": ("KXNCAAFSPREAD", "KXNCAAFTOTAL"),
 }
-MARKET_BREAKDOWN_VERSION = 4
+MARKET_BREAKDOWN_VERSION = 5
 VENUES = ("kalshi", "polymarket_us", "novig", "prophetx")
 
 

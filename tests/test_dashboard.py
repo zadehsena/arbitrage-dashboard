@@ -86,15 +86,23 @@ class DashboardAccountSummaryTest(unittest.TestCase):
 
         self.assertEqual(payload["records"], [record])
 
+    @patch("arbitrage.dashboard.novig_positions")
+    @patch("arbitrage.dashboard.novig_balance")
     @patch("arbitrage.dashboard.polymarket_us_balances")
     @patch("arbitrage.dashboard.kalshi_balance")
-    def test_account_summary_uses_short_dashboard_timeouts(self, kalshi_balance, polymarket_balances):
+    def test_account_summary_uses_short_dashboard_timeouts(self, kalshi_balance, polymarket_balances,
+                                                            novig_balance, novig_positions):
         kalshi_balance.return_value = {"balance": 1250, "portfolio_value": 3000}
         polymarket_balances.return_value = {"balances": [{"currency": "USD", "displayedCash": "7.50"}]}
+        novig_balance.return_value = {"balance": "0.00"}
+        novig_positions.return_value = []
 
         summary = account_summary()
 
         kalshi_balance.assert_called_once_with(timeout=ACCOUNT_SUMMARY_TIMEOUT_SECONDS)
         polymarket_balances.assert_called_once_with(timeout=ACCOUNT_SUMMARY_TIMEOUT_SECONDS)
+        novig_balance.assert_called_once()
+        novig_positions.assert_called_once_with(timeout=ACCOUNT_SUMMARY_TIMEOUT_SECONDS)
         self.assertEqual([wallet["venue"] for wallet in summary["wallets"]],
                          ["Kalshi", "Polymarket US", "Novig", "ProphetX"])
+        self.assertEqual(summary["wallets"][2]["balance"], "0.00")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import ssl
@@ -9,6 +10,9 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from .client import KALSHI_BASE_URL
+
+
+NOVIG_BASE_URL = "https://api.novig.com"
 
 
 def load_dotenv(path: str = ".env") -> None:
@@ -86,3 +90,52 @@ def polymarket_us_get(path: str, timeout: float = 20) -> object:
         "X-PM-Signature": signature,
     }
     return _json(Request("https://api.polymarket.us" + path, headers=headers), timeout)
+
+
+def novig_subaccounts(timeout: float = 20) -> list[dict]:
+    """List Novig subaccounts with the configured read-only management key."""
+    payload = novig_get("/v3/account/subaccounts", timeout)
+    return payload if isinstance(payload, list) else []
+
+
+def novig_balance(subaccount_key_id: str, timeout: float = 20) -> object:
+    """Fetch one Novig subaccount balance; this never submits an order."""
+    return novig_get(f"/v3/account/subaccounts/{subaccount_key_id}/balance", timeout)
+
+
+def novig_positions(timeout: float = 20) -> list[dict]:
+    """List open Novig positions with a trading or trading-read key."""
+    payload = novig_get("/v3/portfolio/positions", timeout)
+    return payload if isinstance(payload, list) else []
+
+
+def novig_get(path: str, timeout: float = 20) -> object:
+    """Make a signed Novig V3 GET request without exposing key material.
+
+    Novig signs six LF-separated fields: scheme, timestamp, method, path,
+    canonical query, and SHA-256 of the (empty for GET) request body.
+    """
+    key_id = os.environ["NOVIG_KEY_ID"]
+    pem = Path(os.environ["NOVIG_PRIVATE_KEY_PATH"]).expanduser().read_bytes()
+    timestamp = str(int(time.time() * 1000))
+    request_path, separator, raw_query = path.partition("?")
+    # Dashboard account reads do not currently use query parameters. Preserve
+    # an explicit query field so all requests still use Novig's V3 layout.
+    canonical_query = raw_query if separator else ""
+    body = b""
+    canonical = "\n".join((
+        "NOVIG-V3", timestamp, "GET", request_path, canonical_query,
+        hashlib.sha256(body).hexdigest(),
+    )).encode()
+
+    from cryptography.hazmat.primitives import serialization
+
+    private_key = serialization.load_pem_private_key(pem, password=None)
+    signature = base64.b64encode(private_key.sign(canonical)).decode()
+    headers = {
+        "Accept": "application/json",
+        "Novig-Key-Id": key_id,
+        "Novig-Timestamp": timestamp,
+        "Novig-Signature": signature,
+    }
+    return _json(Request(NOVIG_BASE_URL + path, headers=headers), timeout)

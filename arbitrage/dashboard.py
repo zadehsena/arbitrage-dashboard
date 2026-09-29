@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal, InvalidOperation
@@ -12,7 +13,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .accounts import kalshi_balance, load_dotenv, polymarket_us_balances
+from .accounts import (
+    kalshi_balance,
+    load_dotenv,
+    novig_balance,
+    novig_positions,
+    polymarket_us_balances,
+)
 from .football import MARKET_BREAKDOWN_VERSION
 from .sports import (
     build_sport_report,
@@ -140,17 +147,15 @@ def account_summary() -> dict:
 
     # Do not let one slow venue delay the whole dashboard. Account requests
     # remain read-only, but this view only needs a brief best-effort snapshot.
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=3) as executor:
         kalshi_future = executor.submit(_kalshi_wallet)
         polymarket_future = executor.submit(_polymarket_wallet)
-        wallets = [kalshi_future.result(), polymarket_future.result()]
+        novig_future = executor.submit(_novig_wallet)
+        wallets = [kalshi_future.result(), polymarket_future.result(), novig_future.result()]
 
-    # These venues do not have account integrations yet. Keep their cards in
-    # the dashboard so the wallet layout reflects every venue being compared.
-    wallets.extend([
-        {"venue": "Novig", "placeholder": True},
-        {"venue": "ProphetX", "placeholder": True},
-    ])
+    # ProphetX does not have an account integration yet. Keep its card in the
+    # dashboard so the wallet layout reflects every venue being compared.
+    wallets.append({"venue": "ProphetX", "placeholder": True})
 
     return {"wallets": wallets, "updated_at": datetime.now(UTC).isoformat()}
 
@@ -182,6 +187,23 @@ def _polymarket_wallet() -> dict:
         return {"venue": "Polymarket US", "balance": None, "portfolio_value": None, "connected": False}
 
 
+def _novig_wallet() -> dict:
+    """Read the configured Novig trading key's cash balance and positions."""
+    try:
+        balance = novig_balance(os.environ["NOVIG_KEY_ID"], timeout=ACCOUNT_SUMMARY_TIMEOUT_SECONDS)
+        # Validate the trading-read key each refresh, but do not invent a
+        # marked portfolio value from the position quantities.
+        novig_positions(timeout=ACCOUNT_SUMMARY_TIMEOUT_SECONDS)
+        return {
+            "venue": "Novig",
+            "balance": f"{Decimal(str(balance['balance'])):.2f}",
+            "portfolio_value": None,
+            "connected": True,
+        }
+    except Exception:
+        return {"venue": "Novig", "balance": None, "portfolio_value": None, "connected": False}
+
+
 def opportunities_payload() -> dict:
     """Summarize cached reports for the home dashboard without new API calls."""
     rows = []
@@ -208,6 +230,8 @@ def opportunities_payload() -> dict:
                 record, "kalshi_moneyline_asks", "contract", "yes_ask", has_draw)
             poly = _ordered_moneyline_quotes(
                 record, "polymarket_us_displayed_moneyline_quotes", "outcome", "displayed_quote", has_draw)
+            novig = _ordered_moneyline_quotes(
+                record, "novig_moneyline_quotes", "outcome", "displayed_ask", has_draw)
             try:
                 if len(kalshi) != len(poly):
                     raise ValueError("venue outcome counts differ")
@@ -220,6 +244,7 @@ def opportunities_payload() -> dict:
                 edge = 0
             rows.append({"sport": sport, "title": record.get("polymarket_us_title") or record.get("kalshi_title"),
                          "start_time": record.get("start_time"), "kalshi": kalshi, "polymarket_us": poly,
+                         "novig": novig,
                          "teams": record.get("teams", []),
                          "edge": edge, "kalshi_ticker": record.get("kalshi_event_ticker"),
                          "polymarket_slug": record.get("polymarket_us_event_slug"),
@@ -279,6 +304,7 @@ def sport_payload(sport: str, leagues: tuple[str, ...] | None = None,
             if any(not record.get("teams") or not record.get("kalshi_url") or not record.get("polymarket_us_url")
                    or not record.get("kalshi_market_breakdown") or not record.get("polymarket_us_market_breakdown")
                    or "market_catalog" not in record
+                   or "novig_moneyline_quotes" not in record
                    or (leagues and record.get("league") not in leagues)
                    or record.get("market_breakdown_version") != MARKET_BREAKDOWN_VERSION
                    for record in records):
